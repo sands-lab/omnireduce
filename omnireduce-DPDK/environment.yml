@@ -1,0 +1,60 @@
+name: omnireduce
+
+channels:
+  - conda-forge
+  - defaults
+  - pytorch
+
+dependencies:
+  - absl-py<0.9 # WideAndDeep
+    #  - apache-beam # WideAndDeep
+  - defaults::boost-cpp=1.65 # compatible with daiet
+  - cffi # horovod, pytorch
+  - cloudpickle  # horovod
+  - cmake # pytorch
+  - cudatoolkit-dev=10.1
+  - cudnn=7.6
+  - cupy # ncf
+  - cython=0.28 # pytorch ssd detection
+  - h5py
+  - html2text # bert
+  - libprotobuf=3.8 # tensorflow build
+  - magma-cuda101
+  - mkl # pytorch
+  - mkl-include # pytorch
+  - mpi4py
+  - nccl=2.4
+  - networkx # bert
+  - ninja # pytorch
+  - nltk # bert
+  - numpy<2 # pytorch
+  - openmpi=4.0
+  - pandas # ncf
+  - pip=20.0
+  - pip:
+    - git+git://github.com/NVIDIA/dllogger#egg=dllogger # ncf
+      #- gluoncv
+      #- mxnet-cu101mkl==1.6.0
+    - opt_einsum # WideAndDeep
+    - ray[rllib]
+    - sacremoses==0.0.35 # Transformer-XL
+    - scikit-learn # DLRM
+    - tensorflow-transform==0.21.* # WideAndDeep
+  - progressbar # bert
+  - protobuf # WideAndDeep
+  - psutil # horovod
+  - pycocotools=2.0 # pytorch ssd detection
+  - pycparser # horovod
+  - pydot<2 # WideAndDeep
+  - py-opencv # GAN
+  - pyspark
+  - pytest # bert
+  - python=3.7
+  - pyyaml # horovod, pytorch
+  - scikit-image=0.15 # pytorch ssd detection
+  - scipy
+  - setuptools # pytorch
+  - six<2 # WideAndDeep
+  - tensorflow-gpu=1.15
+  - toposort # bert
+  - tqdm

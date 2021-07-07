@@ -1,0 +1,522 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b87b1c1..e94d143 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -21,6 +21,7 @@ option(BUILD_TEST "Build test binary (requires gtest)" OFF)
+ option(BUILD_BENCHMARK "Build benchmark binary (requires hiredis)" OFF)
+ 
+ # Option defaults (so they can be overwritten before declaring the option)
++set(USE_DAIET_DEFAULT OFF)
+ set(USE_REDIS_DEFAULT OFF)
+ set(USE_IBVERBS_DEFAULT OFF)
+ set(USE_NCCL_DEFAULT OFF)
+@@ -28,6 +29,7 @@ set(USE_RCCL_DEFAULT OFF)
+ set(USE_LIBUV_DEFAULT OFF)
+ 
+ # Options
++option(USE_DAIET "Support using DAIET for in-network aggregation" ${USE_DAIET_DEFAULT})
+ option(USE_REDIS "Support using Redis for rendezvous" ${USE_REDIS_DEFAULT})
+ option(USE_IBVERBS "Support ibverbs transport" ${USE_IBVERBS_DEFAULT})
+ option(USE_NCCL "Support using NCCL for local collectives" ${USE_NCCL_DEFAULT})
+@@ -79,7 +81,7 @@ include_directories(${PROJECT_SOURCE_DIR})
+ include_directories(${PROJECT_BINARY_DIR})
+ 
+ # Compiler flags
+-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -fPIC")
++set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -fPIC -mf16c")
+ 
+ # Recurse into main project directory
+ add_subdirectory(gloo)
+diff --git a/cmake/Dependencies.cmake b/cmake/Dependencies.cmake
+index 60ae801..6374c0c 100644
+--- a/cmake/Dependencies.cmake
++++ b/cmake/Dependencies.cmake
+@@ -5,6 +5,12 @@ set(gloo_hip_DEPENDENCY_LIBS "")
+ # Configure path to modules (for find_package)
+ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${PROJECT_SOURCE_DIR}/cmake/Modules/")
+ 
++if(USE_DAIET)
++  include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../daiet/build/include)
++else()
++  message(WARNING "Compiling vanilla gloo")
++endif()
++
+ if(USE_REDIS)
+   find_package(hiredis REQUIRED)
+   if(HIREDIS_FOUND)
+@@ -63,10 +69,10 @@ endif()
+ if(USE_MPI)
+   find_package(MPI)
+   if(MPI_C_FOUND)
+-    message(STATUS "MPI include path: " ${MPI_CXX_INCLUDE_PATH})
+-    message(STATUS "MPI libraries: " ${MPI_CXX_LIBRARIES})
+-    include_directories(SYSTEM ${MPI_CXX_INCLUDE_PATH})
+-    list(APPEND gloo_DEPENDENCY_LIBS ${MPI_CXX_LIBRARIES})
++    message(STATUS "MPI include path: " ${MPI_C_INCLUDE_PATH})
++    message(STATUS "MPI libraries: " ${MPI_C_LIBRARIES})
++    include_directories(SYSTEM ${MPI_C_INCLUDE_PATH})
++    list(APPEND gloo_DEPENDENCY_LIBS ${MPI_C_LIBRARIES})
+     add_definitions(-DGLOO_USE_MPI=1)
+   else()
+     message(WARNING "Not compiling with MPI support. Suppress this warning with -DUSE_MPI=OFF.")
+diff --git a/gloo/CMakeLists.txt b/gloo/CMakeLists.txt
+index 7449849..920049f 100644
+--- a/gloo/CMakeLists.txt
++++ b/gloo/CMakeLists.txt
+@@ -6,6 +6,7 @@ set(GLOO_HDRS)
+ 
+ # Compiled sources in root directory
+ list(APPEND GLOO_SRCS
++  "${CMAKE_CURRENT_SOURCE_DIR}/math.cc"
+   "${CMAKE_CURRENT_SOURCE_DIR}/algorithm.cc"
+   "${CMAKE_CURRENT_SOURCE_DIR}/allgather.cc"
+   "${CMAKE_CURRENT_SOURCE_DIR}/allgatherv.cc"
+@@ -120,6 +121,7 @@ endif()
+ 
+ # Write configuration header.
+ # Set variables so macros have GLOO_ prefix.
++set(GLOO_USE_DAIET ${USE_DAIET})
+ set(GLOO_USE_CUDA ${USE_CUDA})
+ set(GLOO_USE_NCCL ${USE_NCCL})
+ set(GLOO_USE_ROCM ${USE_ROCM})
+diff --git a/gloo/allreduce.cc b/gloo/allreduce.cc
+index cc3a7c4..70676dc 100644
+--- a/gloo/allreduce.cc
++++ b/gloo/allreduce.cc
+@@ -151,6 +151,36 @@ void ring(
+   const auto slot = Slot::build(kAllreduceSlotPrefix, opts.tag);
+   const size_t totalBytes = opts.elements * opts.elementSize;
+ 
++#if GLOO_USE_DAIET
++  switch (opts.datatype) {
++    case detail::AllreduceOptionsImpl::FLOAT16:
++      reduceInputs(0, totalBytes);
++      if (context->daietContext.try_daiet((gloo::float16*)out[0]->ptr, opts.elements, 1)){
++          // Broadcast ptrs_[0]
++          broadcastOutputs(0, totalBytes);
++          return;
++      }
++      break;
++    case detail::AllreduceOptionsImpl::FLOAT32:
++      reduceInputs(0, totalBytes);
++      if (context->daietContext.try_daiet((float*)out[0]->ptr, opts.elements, 1)){
++          // Broadcast ptrs_[0]
++          broadcastOutputs(0, totalBytes);
++          return;
++      }
++      break;
++    case detail::AllreduceOptionsImpl::INT32:
++      reduceInputs(0, totalBytes);
++      if (context->daietContext.try_daiet((int32_t*)out[0]->ptr, opts.elements, 1)){
++          // Broadcast ptrs_[0]
++          broadcastOutputs(0, totalBytes);
++          return;
++      }
++      break;
++  }
++    // Fallback
++#endif
++
+   // Note: context->size > 1
+   const auto recvRank = (context->size + context->rank + 1) % context->size;
+   const auto sendRank = (context->size + context->rank - 1) % context->size;
+@@ -432,6 +462,37 @@ void bcube(
+   const auto elementSize = opts.elementSize;
+   auto& out = opts.out[0];
+ 
++#if GLOO_USE_DAIET
++  const size_t totalBytes = opts.elements * opts.elementSize;
++  switch (opts.datatype) {
++    case detail::AllreduceOptionsImpl::FLOAT16:
++      reduceInputs(0, totalBytes);
++      if (context->daietContext.try_daiet((gloo::float16*)out->ptr, opts.elements, 1)){
++          // Broadcast ptrs_[0]
++          broadcastOutputs(0, totalBytes);
++          return;
++      }
++      break;
++    case detail::AllreduceOptionsImpl::FLOAT32:
++      reduceInputs(0, totalBytes);
++      if (context->daietContext.try_daiet((float*)out->ptr, opts.elements, 1)){
++          // Broadcast ptrs_[0]
++          broadcastOutputs(0, totalBytes);
++          return;
++      }
++      break;
++    case detail::AllreduceOptionsImpl::INT32:
++      reduceInputs(0, totalBytes);
++      if (context->daietContext.try_daiet((int32_t*)out->ptr, opts.elements, 1)){
++          // Broadcast ptrs_[0]
++          broadcastOutputs(0, totalBytes);
++          return;
++      }
++      break;
++  }
++    // Fallback
++#endif
++
+   constexpr auto n = 2;
+ 
+   // Figure out the number of steps in this algorithm.
+diff --git a/gloo/allreduce.h b/gloo/allreduce.h
+index 904eb8b..650122a 100644
+--- a/gloo/allreduce.h
++++ b/gloo/allreduce.h
+@@ -14,6 +14,7 @@
+ 
+ #include "gloo/context.h"
+ #include "gloo/transport/unbound_buffer.h"
++#include "gloo/types.h"
+ 
+ namespace gloo {
+ 
+@@ -41,10 +42,19 @@ struct AllreduceOptionsImpl {
+     BCUBE = 2,
+   };
+ 
++  enum DataType {
++    FLOAT16 = 1,
++    FLOAT32 = 2,
++    INT32 = 3,
++    INT64 = 4,
++    DOUBLE = 5,
++  };
++
+   explicit AllreduceOptionsImpl(const std::shared_ptr<Context>& context)
+       : context(context),
+         timeout(context->getTimeout()),
+-        algorithm(UNSPECIFIED) {}
++        algorithm(UNSPECIFIED),
++        datatype(FLOAT32) {}
+ 
+   std::shared_ptr<Context> context;
+ 
+@@ -65,6 +75,9 @@ struct AllreduceOptionsImpl {
+   // Number of bytes per element.
+   size_t elementSize = 0;
+ 
++  // Datatype of elements.
++  DataType datatype;
++
+   // Reduction function.
+   Func reduce;
+ 
+@@ -159,6 +172,8 @@ class AllreduceOptions {
+ 
+   template <typename T>
+   void setOutputs(T** ptrs, size_t len, size_t elements) {
++    T t;
++    setDataType(t);
+     impl_.elements = elements;
+     impl_.elementSize = sizeof(T);
+     impl_.out.reserve(len);
+@@ -168,6 +183,30 @@ class AllreduceOptions {
+     }
+   }
+ 
++  void setDataType(int t) {
++    impl_.datatype = detail::AllreduceOptionsImpl::INT32;
++    return;
++  }
++  void setDataType(gloo::float16 t) {
++    impl_.datatype = detail::AllreduceOptionsImpl::FLOAT16;
++    return;
++  }
++  void setDataType(float t) {
++    impl_.datatype = detail::AllreduceOptionsImpl::FLOAT32;
++    return;
++  }
++  void setDataType(long long t) {
++    impl_.datatype = detail::AllreduceOptionsImpl::INT64;
++    return;
++  }
++  void setDataType(long int t) {
++    impl_.datatype = detail::AllreduceOptionsImpl::INT64;
++    return;
++  }
++  void setDataType(double t) {
++    impl_.datatype = detail::AllreduceOptionsImpl::DOUBLE;
++    return;
++  }
+   void setReduceFunction(Func fn) {
+     impl_.reduce = fn;
+   }
+diff --git a/gloo/allreduce_bcube.h b/gloo/allreduce_bcube.h
+index daa9080..1cfca44 100644
+--- a/gloo/allreduce_bcube.h
++++ b/gloo/allreduce_bcube.h
+@@ -348,6 +348,20 @@ class AllreduceBcube : public Algorithm {
+       return;
+     }
+ 
++#if GLOO_USE_DAIET
++    if (this->context_->daietContext.try_daiet(ptrs_[0],totalNumElems_,fn_->type())){
++
++        // Broadcast ptrs_[0]
++        for (int i = 1; i < ptrs_.size(); i++) {
++          memcpy(ptrs_[i], ptrs_[0], bytes_);
++        }
++
++        return;
++    }
++
++    // Fallback
++#endif
++
+     // Reduce-scatter
+     DEBUG_PRINT_STAGE("start");
+     for (int step = 0; step < steps_; ++step) {
+diff --git a/gloo/allreduce_halving_doubling.h b/gloo/allreduce_halving_doubling.h
+index 8aefcd7..843117c 100644
+--- a/gloo/allreduce_halving_doubling.h
++++ b/gloo/allreduce_halving_doubling.h
+@@ -237,6 +237,20 @@ class AllreduceHalvingDoubling : public Algorithm {
+       return;
+     }
+ 
++#if GLOO_USE_DAIET
++    if (this->context_->daietContext.try_daiet(ptrs_[0],count_,fn_->type())){
++
++        // Broadcast ptrs_[0]
++        for (int i = 1; i < ptrs_.size(); i++) {
++          memcpy(ptrs_[i], ptrs_[0], bytes_);
++        }
++
++        return;
++    }
++
++    // Fallback
++#endif
++
+     // Reduce-scatter
+     for (int i = 0; i < stepsWithinBlock_; i++) {
+       if (sendOffsets_[i] < count_) {
+diff --git a/gloo/allreduce_ring.h b/gloo/allreduce_ring.h
+index 66873bb..36050ba 100644
+--- a/gloo/allreduce_ring.h
++++ b/gloo/allreduce_ring.h
+@@ -72,6 +72,28 @@ class AllreduceRing : public Algorithm {
+       fn_->call(ptrs_[0], ptrs_[i], count_);
+     }
+ 
++    if (this->contextSize_ == 1) {
++      // Broadcast ptrs_[0]
++      for (int i = 1; i < ptrs_.size(); i++) {
++        memcpy(ptrs_[i], ptrs_[0], bytes_);
++      }
++      return;
++    }
++
++#if GLOO_USE_DAIET
++    if (this->context_->daietContext.try_daiet(ptrs_[0],count_,fn_->type())){
++
++        // Broadcast ptrs_[0]
++        for (int i = 1; i < ptrs_.size(); i++) {
++          memcpy(ptrs_[i], ptrs_[0], bytes_);
++        }
++
++        return;
++    }
++
++    // Fallback
++#endif
++
+     // Intialize outbox with locally reduced values
+     memcpy(outbox_, ptrs_[0], bytes_);
+ 
+diff --git a/gloo/allreduce_ring_chunked.h b/gloo/allreduce_ring_chunked.h
+index 484187e..583b62c 100644
+--- a/gloo/allreduce_ring_chunked.h
++++ b/gloo/allreduce_ring_chunked.h
+@@ -90,6 +90,20 @@ class AllreduceRingChunked : public Algorithm {
+       return;
+     }
+ 
++#if GLOO_USE_DAIET
++    if (this->context_->daietContext.try_daiet(ptrs_[0],count_,fn_->type())){
++
++        // Broadcast ptrs_[0]
++        for (int i = 1; i < ptrs_.size(); i++) {
++          memcpy(ptrs_[i], ptrs_[0], bytes_);
++        }
++
++        return;
++    }
++
++    // Fallback
++#endif
++
+     // Kick off copying initial chunks
+     copyChunkAtOffset(2 * this->contextRank_);
+     copyChunkAtOffset(2 * this->contextRank_ + 1);
+diff --git a/gloo/config.h.in b/gloo/config.h.in
+index 657568f..198553a 100644
+--- a/gloo/config.h.in
++++ b/gloo/config.h.in
+@@ -23,6 +23,7 @@ static_assert(
+   (GLOO_VERSION_MAJOR * 10000 + GLOO_VERSION_MINOR * 100 +   \
+    GLOO_VERSION_PATCH)
+ 
++#cmakedefine01 GLOO_USE_DAIET
+ #cmakedefine01 GLOO_USE_CUDA
+ #cmakedefine01 GLOO_USE_NCCL
+ #cmakedefine01 GLOO_USE_ROCM
+diff --git a/gloo/context.h b/gloo/context.h
+index da6933d..816a46c 100644
+--- a/gloo/context.h
++++ b/gloo/context.h
+@@ -14,6 +14,11 @@
+ 
+ #include <gloo/transport/pair.h>
+ 
++#include "gloo/config.h"
++#if GLOO_USE_DAIET
++ #include "daiet/DaietContext.hpp"
++#endif
++
+ namespace gloo {
+ 
+ // There is no need to materialize all transport types here.
+@@ -32,6 +37,10 @@ class Context {
+   const int size;
+   int base;
+ 
++#if GLOO_USE_DAIET
++   daiet::DaietContext& daietContext = daiet::DaietContext::getInstance();
++#endif
++
+   std::shared_ptr<transport::Device>& getDevice();
+ 
+   std::unique_ptr<transport::Pair>& getPair(int i);
+diff --git a/gloo/cuda_allreduce_bcube.cc b/gloo/cuda_allreduce_bcube.cc
+index cbcdced..64e1638 100644
+--- a/gloo/cuda_allreduce_bcube.cc
++++ b/gloo/cuda_allreduce_bcube.cc
+@@ -128,6 +128,23 @@ void CudaAllreduceBcube<T, W>::run() {
+     return;
+   }
+ 
++#if GLOO_USE_DAIET
++  if (std::is_same<W, CudaHostWorkspace<T>>::value){
++      // scratch is a CudaHostPointer
++      if (this->context_->daietContext.try_daiet(*scratch_,totalNumElems_,fn_->type())){
++
++          // Asynchronously copy result buffer to all device buffers
++          if (localBroadcastOp_) {
++              localBroadcastOp_->runAsync();
++              localBroadcastOp_->wait();
++          }
++          return;
++      }
++  }
++
++  // Fallback
++#endif
++
+   // Reduce-scatter
+   DEBUG_PRINT_STAGE("start");
+   for (int step = 0; step < steps_; ++step) {
+diff --git a/gloo/cuda_allreduce_halving_doubling.cc b/gloo/cuda_allreduce_halving_doubling.cc
+index b63b50b..d3eda39 100644
+--- a/gloo/cuda_allreduce_halving_doubling.cc
++++ b/gloo/cuda_allreduce_halving_doubling.cc
+@@ -262,6 +262,23 @@ void CudaAllreduceHalvingDoubling<T, W>::run() {
+     return;
+   }
+ 
++#if GLOO_USE_DAIET
++  if (std::is_same<W, CudaHostWorkspace<T>>::value){
++      // scratch is a CudaHostPointer
++      if (this->context_->daietContext.try_daiet(*scratch_,count_,fn_->type())){
++
++          // Asynchronously copy result buffer to all device buffers
++          if (localBroadcastOp_) {
++              localBroadcastOp_->runAsync();
++              localBroadcastOp_->wait();
++          }
++          return;
++      }
++  }
++
++  // Fallback
++#endif
++
+   // Reduce-scatter
+   for (int i = 0; i < stepsWithinBlock_; i++) {
+     if (sendOffsets_[i] < count_) {
+diff --git a/gloo/cuda_allreduce_ring.cc b/gloo/cuda_allreduce_ring.cc
+index ad80230..112d5af 100644
+--- a/gloo/cuda_allreduce_ring.cc
++++ b/gloo/cuda_allreduce_ring.cc
+@@ -78,6 +78,25 @@ void CudaAllreduceRing<T, W>::run() {
+     localReduceOp_->run();
+   }
+ 
++#if GLOO_USE_DAIET
++  if (std::is_same<W, CudaHostWorkspace<T>>::value){
++      // scratch is a CudaHostPointer
++      if (this->context_->daietContext.try_daiet(*scratch_,count_,fn_->type())){
++
++          // Asynchronously copy result buffer to all device buffers
++          if (localBroadcastOp_) {
++              localBroadcastOp_->runAsync();
++              if (synchronizeDeviceOutputs_) {
++                localBroadcastOp_->wait();
++              }
++          }
++          return;
++      }
++  }
++
++  // Fallback
++#endif
++
+   // Initialize outbox with locally reduced values
+   stream.copyAsync(outbox_, scratch_);
+   stream.wait();
+diff --git a/gloo/cuda_allreduce_ring_chunked.cc b/gloo/cuda_allreduce_ring_chunked.cc
+index 87b3652..5c77592 100644
+--- a/gloo/cuda_allreduce_ring_chunked.cc
++++ b/gloo/cuda_allreduce_ring_chunked.cc
+@@ -166,6 +166,28 @@ void CudaAllreduceRingChunked<T, W>::run() {
+     return;
+   }
+ 
++#if GLOO_USE_DAIET
++  if (std::is_same<W, CudaHostWorkspace<T>>::value){
++      // scratch is a CudaHostPointer
++      if (this->context_->daietContext.try_daiet(*scratch_,count_,fn_->type())){
++
++          // Wait for broadcast to complete
++          for (auto i = 0; i < chunks_; i++) {
++            const auto chunkOffset = getChunkOffset(i);
++            if (chunkOffset < chunkContext_.size()) {
++              auto& context = chunkContext_[chunkOffset];
++              context.broadcastOp->runAsync();
++              context.broadcastOp->wait();
++            }
++          }
++
++          return;
++      }
++  }
++
++  // Fallback
++#endif
++
+   // First pass reduces a chunk in each round
+   for (auto round = 0; round < chunks_; round++) {
+     const auto chunkOffset = getChunkOffset(round);
+diff --git a/gloo/math.cc b/gloo/math.cc
+index 8f45854..c054f5c 100644
+--- a/gloo/math.cc
++++ b/gloo/math.cc
+@@ -2,6 +2,8 @@
+ 
+ #include <algorithm>
+ 
++#include "gloo/config.h"
++
+ #if GLOO_USE_AVX
+ #include <immintrin.h>
+ #endif

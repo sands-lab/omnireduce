@@ -1,0 +1,7 @@
+*.log
+/build
+/lib/dpdk/build
+/example/build
+/ps/build
+/experiments/exp1/build
+/experiments/exp2/build

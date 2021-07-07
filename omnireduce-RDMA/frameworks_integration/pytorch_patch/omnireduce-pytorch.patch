@@ -1,0 +1,182 @@
+From be02e214e79f0a4326404c6de30c0fcfda252a8d Mon Sep 17 00:00:00 2001
+From: Phlix1 <819108840@qq.com>
+Date: Fri, 19 Mar 2021 18:18:15 +0000
+Subject: [PATCH] Add OmniReduce Support
+
+---
+ torch/csrc/distributed/c10d/init.cpp |  2 +-
+ torch/lib/c10d/CMakeLists.txt        |  5 ++
+ torch/lib/c10d/ProcessGroupGloo.cpp  | 84 ++++++++++++++++++++--------
+ torch/lib/c10d/ProcessGroupGloo.hpp  |  2 +
+ 4 files changed, 70 insertions(+), 23 deletions(-)
+
+diff --git a/torch/csrc/distributed/c10d/init.cpp b/torch/csrc/distributed/c10d/init.cpp
+index 715403ac57..147fd305d0 100644
+--- a/torch/csrc/distributed/c10d/init.cpp
++++ b/torch/csrc/distributed/c10d/init.cpp
+@@ -913,7 +913,7 @@ Arguments:
+             }
+ 
+             options.timeout = timeout;
+-            options.threads = options.devices.size() * 2;
++            options.threads = 1;//options.devices.size() * 2;
+             return std::make_shared<::c10d::ProcessGroupGloo>(
+                 store, rank, size, options);
+           }),
+diff --git a/torch/lib/c10d/CMakeLists.txt b/torch/lib/c10d/CMakeLists.txt
+index 4b206f3801..b6db9afa9f 100644
+--- a/torch/lib/c10d/CMakeLists.txt
++++ b/torch/lib/c10d/CMakeLists.txt
+@@ -76,6 +76,7 @@ if(USE_C10D_GLOO)
+ endif()
+ 
+ add_library(c10d STATIC ${C10D_SRCS})
++target_link_libraries(c10d PUBLIC boost_system boost_thread boost_chrono boost_program_options omnireduce)
+ set_property(TARGET c10d PROPERTY POSITION_INDEPENDENT_CODE ON)
+ set_property(TARGET c10d PROPERTY CXX_STANDARD 14)
+ 
+diff --git a/torch/lib/c10d/ProcessGroupGloo.cpp b/torch/lib/c10d/ProcessGroupGloo.cpp
+index c139ac7a34..d16a5cdab9 100644
+--- a/torch/lib/c10d/ProcessGroupGloo.cpp
++++ b/torch/lib/c10d/ProcessGroupGloo.cpp
+@@ -1185,16 +1185,29 @@ class AsyncAllreduceCUDAWork : public AsyncAllreduceWork {
+       const std::shared_ptr<gloo::Context>& context,
+       std::vector<at::Tensor>& inputs,
+       ReduceOp reduceOp,
+-      uint32_t tag)
+-      : AsyncAllreduceWork(context, inputs, reduceOp, tag) {
+-    initializeStreamsEvents(inputs, streams, events);
++      uint32_t tag, 
++      omnireduce::OmniContext& omniContext)
++      : AsyncAllreduceWork(context, inputs, reduceOp, tag), omniContext(omniContext) {
++    const auto& scalarType = inputs[0].scalar_type();
++    if (reduceOp == ReduceOp::SUM && (scalarType == ::at::ScalarType::Float)) {
++        initializeStreamsEvents(inputs, streams, events);
++        at::cuda::OptionalCUDAStreamGuard guard;
++        for (size_t i = 0; i < inputs.size(); i++) {
++            guard.reset_stream(streams[i]);
++        }
++        use_omnireduce=true;
++    }
++    else {
++        initializeStreamsEvents(inputs, streams, events);
+ 
+-    // Kick off copy from CUDA tensors to pinned CPU tensors.
+-    tmp.reserve(inputs.size());
+-    at::cuda::OptionalCUDAStreamGuard guard;
+-    for (size_t i = 0; i < inputs.size(); i++) {
+-      guard.reset_stream(streams[i]);
+-      tmp.push_back(pinnedLike(inputs[i]).copy_(inputs[i], true));
++        // Kick off copy from CUDA tensors to pinned CPU tensors.
++        tmp.reserve(inputs.size());
++        at::cuda::OptionalCUDAStreamGuard guard;
++        for (size_t i = 0; i < inputs.size(); i++) {
++            guard.reset_stream(streams[i]);
++            tmp.push_back(pinnedLike(inputs[i]).copy_(inputs[i], true));
++        }
++        use_omnireduce=false;
+     }
+   }
+ 
+@@ -1207,13 +1220,33 @@ class AsyncAllreduceCUDAWork : public AsyncAllreduceWork {
+     }
+ 
+     // Run allreduce on host side tensors.
+-    allreduce(tmp);
+-
+-    at::cuda::OptionalCUDAStreamGuard stream_guard;
+-    for (size_t i = 0; i < inputs.size(); i++) {
+-      stream_guard.reset_stream(streams[i]);
+-      inputs[i].copy_(tmp[i], /* non_blocking */ true);
+-      events[i].record(streams[i]);
++    if (use_omnireduce) {
++      const auto& scalarType = inputs[0].scalar_type();
++      switch (scalarType) {
++        case ::at::ScalarType::Float:
++          //omniContext.AllReduce(getDataPointer<float>(inputs[0]), int(inputs[0].numel()), streams[0].stream(), inputs[0].device().index(), true, false);
++          omniContext.AllReduce(getDataPointer<float>(inputs[0]), int(inputs[0].numel()), streams[0].stream(), inputs[0].device().index());
++          break;
++        case ::at::ScalarType::Int:
++          //omniContext.AllReduce(getDataPointer<int32_t>(inputs[0]), int(inputs[0].numel()), streams[0].stream(), inputs[0].device().index(), true, false);
++          omniContext.AllReduce(getDataPointer<int32_t>(inputs[0]), int(inputs[0].numel()), streams[0].stream(), inputs[0].device().index());
++          break; 
++        default:
++          std::cerr<<"Data type error"<<std::endl;
++      }
++      at::cuda::OptionalCUDAStreamGuard stream_guard;
++      for (size_t i = 0; i < inputs.size(); i++) {
++          stream_guard.reset_stream(streams[i]);
++      }
++    }
++    else {
++      allreduce(tmp);
++      at::cuda::OptionalCUDAStreamGuard stream_guard;
++      for (size_t i = 0; i < inputs.size(); i++) {
++        stream_guard.reset_stream(streams[i]);
++        inputs[i].copy_(tmp[i],  true);
++        events[i].record(streams[i]);
++      }
+     }
+ 
+     outputs_ = inputs;
+@@ -1221,16 +1254,23 @@ class AsyncAllreduceCUDAWork : public AsyncAllreduceWork {
+ 
+   void synchronize() override {
+     // Synchronize with the copy back to CUDA tensors.
+-    at::cuda::OptionalCUDAGuard guard;
+-    for (size_t i = 0; i < inputs.size(); i++) {
+-      guard.set_index(inputs[i].device().index());
+-      events[i].block(at::cuda::getCurrentCUDAStream());
++    if (!use_omnireduce) {
++      at::cuda::OptionalCUDAGuard guard;
++      for (size_t i = 0; i < inputs.size(); i++) {
++        guard.set_index(inputs[i].device().index());
++        events[i].block(at::cuda::getCurrentCUDAStream());
++      }
+     }
+   }
+-
++  bool use_omnireduce;
++  omnireduce::OmniContext& omniContext;
+   std::vector<at::Tensor> tmp;
+   std::vector<at::cuda::CUDAStream> streams;
+   std::vector<at::cuda::CUDAEvent> events;
++  std::vector<at::cuda::CUDAEvent> events_bitmap;
++  std::vector<at::Tensor> bitmaps;
++  std::vector<at::Tensor> tmp_bitmap;
++  std::vector<at::cuda::CUDAStream> streams_bitmap;
+ };
+ 
+ class AsyncSparseAllreduceCUDAWork : public AsyncSparseAllreduceWork {
+@@ -1344,7 +1384,7 @@ std::shared_ptr<ProcessGroup::Work> ProcessGroupGloo::allreduce(
+   } else if (device.type() == at::kCUDA) {
+     if (layout == c10::kStrided) {
+       work = std::make_shared<AsyncAllreduceCUDAWork>(
+-          std::move(context), inputs, opts.reduceOp, tag);
++          std::move(context), inputs, opts.reduceOp, tag, omniContext);
+     } else if (layout == c10::kSparse) {
+       work = std::make_shared<AsyncSparseAllreduceCUDAWork>(
+           std::move(context), inputs, tag);
+diff --git a/torch/lib/c10d/ProcessGroupGloo.hpp b/torch/lib/c10d/ProcessGroupGloo.hpp
+index dfae068de2..ac3c677dbb 100644
+--- a/torch/lib/c10d/ProcessGroupGloo.hpp
++++ b/torch/lib/c10d/ProcessGroupGloo.hpp
+@@ -12,6 +12,7 @@
+ #include <gloo/context.h>
+ #include <gloo/rendezvous/store.h>
+ #include <gloo/transport/device.h>
++#include <omnireduce/context.hpp>
+ 
+ #include <c10/util/hash.h>
+ 
+@@ -235,6 +236,7 @@ class ProcessGroupGloo : public ProcessGroup {
+   // In order to use more than one device (or allow for parallelism on
+   // a single device), you need multiple contexts.
+   std::vector<std::shared_ptr<::gloo::Context>> contexts_;
++  omnireduce::OmniContext& omniContext = omnireduce::OmniContext::getInstance();
+   std::vector<std::thread> threads_;
+   bool stop_;
+ 
+-- 
+2.17.1
+

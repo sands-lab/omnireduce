@@ -1,0 +1,382 @@
+diff --git a/aten/src/ATen/native/cuda/TensorTransformations.cu b/aten/src/ATen/native/cuda/TensorTransformations.cu
+index 4318b35c12..86acbb25b3 100644
+--- a/aten/src/ATen/native/cuda/TensorTransformations.cu
++++ b/aten/src/ATen/native/cuda/TensorTransformations.cu
+@@ -8,6 +8,8 @@
+ 
+ #include <cstddef>
+ #include <vector>
++#include <cmath>
++#include <cfloat>
+ 
+ namespace at {
+ namespace native {
+@@ -15,6 +17,38 @@ namespace native {
+ constexpr uint32_t AT_APPLY_THREADS_PER_BLOCK = 512;
+ constexpr uint32_t AT_APPLY_BLOCKS_PER_SM = 4;
+ 
++
++template <typename scalar_t>
++__global__ void bitmap_cuda_kernel(scalar_t* input, uint8_t* bitmap, int64_t len) {
++  const auto index = blockIdx.x * blockDim.x + threadIdx.x;
++  __shared__ bool zero_block;
++  if (threadIdx.x == 0) zero_block = true;
++  if(index < len) {
++    if(std::abs(input[index]) > FLT_EPSILON) zero_block=false;
++    __syncthreads();
++    if(zero_block) {
++      input[index]=0;
++      bitmap[blockIdx.x]=1;
++    }
++  }
++}
++
++Tensor bitmap(const Tensor& self, int64_t block_size) {
++  auto in_tensor = self;
++  auto numel = in_tensor.numel();
++  auto bitmap_size = numel/block_size;
++  if (numel%block_size || !bitmap_size) // pad if needed, ensure at least one block
++    bitmap_size++;
++  auto bitmap = at::zeros({bitmap_size}, at::device(kCUDA).dtype(kByte));
++
++  AT_DISPATCH_ALL_TYPES(in_tensor.scalar_type(), "bitmap", ([&] {
++    bitmap_cuda_kernel<scalar_t><<<bitmap_size, block_size, 0, at::cuda::getCurrentCUDAStream()>>>(
++      in_tensor.data_ptr<scalar_t>(), bitmap.data_ptr<uint8_t>(), numel);
++  }));
++  return bitmap;
++}
++
++
+ template <typename scalar_t, typename IndexType>
+ #if __CUDA_ARCH__ >= 350 || defined __HIP_PLATFORM_HCC__
+ C10_LAUNCH_BOUNDS_2(AT_APPLY_THREADS_PER_BLOCK, AT_APPLY_BLOCKS_PER_SM)
+diff --git a/aten/src/ATen/native/native_functions.yaml b/aten/src/ATen/native/native_functions.yaml
+index 4d748250ab..d4e90156a1 100644
+--- a/aten/src/ATen/native/native_functions.yaml
++++ b/aten/src/ATen/native/native_functions.yaml
+@@ -1,5 +1,8 @@
+ # See README.md in this directory for more guidance
+ 
++- func: bitmap(Tensor self, int block_size=256) -> Tensor
++  variants: function, method
++
+ # *********NB: _cast_* operators are DEPRECATED and will be removed
+ # eventually. These were previously used before TorchScript IR supported
+ # representing ScalarType's. They are now superseded by usage of
+diff --git a/cmake/Dependencies.cmake b/cmake/Dependencies.cmake
+index d1e4bdaed6..b67435de93 100644
+--- a/cmake/Dependencies.cmake
++++ b/cmake/Dependencies.cmake
+@@ -1251,59 +1251,6 @@ if(USE_CUDA)
+     include_directories(SYSTEM ${CMAKE_CURRENT_LIST_DIR}/../third_party/cub)
+   endif()
+ endif()
+-
+-if(USE_GLOO)
+-  if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+-    message(WARNING "Gloo can only be used on 64-bit systems.")
+-    caffe2_update_option(USE_GLOO OFF)
+-  else()
+-    set(GLOO_INSTALL ON CACHE BOOL "" FORCE)
+-    set(GLOO_STATIC_OR_SHARED STATIC CACHE STRING "" FORCE)
+-
+-    # Temporarily override variables to avoid building Gloo tests/benchmarks
+-    set(__BUILD_TEST ${BUILD_TEST})
+-    set(__BUILD_BENCHMARK ${BUILD_BENCHMARK})
+-    set(BUILD_TEST OFF)
+-    set(BUILD_BENCHMARK OFF)
+-    if(USE_ROCM)
+-      set(ENV{GLOO_ROCM_ARCH} "${PYTORCH_ROCM_ARCH}")
+-    endif()
+-    if(NOT USE_SYSTEM_GLOO)
+-      add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../third_party/gloo)
+-    else()
+-      add_library(gloo SHARED IMPORTED)
+-      find_library(GLOO_LIBRARY gloo)
+-      if(NOT GLOO_LIBRARY)
+-        message(FATAL_ERROR "Cannot find gloo")
+-      endif()
+-      message("Found gloo: ${GLOO_LIBRARY}")
+-      set_target_properties(gloo PROPERTIES IMPORTED_LOCATION ${GLOO_LIBRARY})
+-    endif()
+-    # Here is a little bit hacky. We have to put PROJECT_BINARY_DIR in front
+-    # of PROJECT_SOURCE_DIR with/without conda system. The reason is that
+-    # gloo generates a new config.h in the binary diretory.
+-    include_directories(BEFORE SYSTEM ${CMAKE_CURRENT_LIST_DIR}/../third_party/gloo)
+-    include_directories(BEFORE SYSTEM ${PROJECT_BINARY_DIR}/third_party/gloo)
+-    set(BUILD_TEST ${__BUILD_TEST})
+-    set(BUILD_BENCHMARK ${__BUILD_BENCHMARK})
+-
+-    # Add explicit dependency since NCCL is built from third_party.
+-    # Without dependency, make -jN with N>1 can fail if the NCCL build
+-    # hasn't finished when CUDA targets are linked.
+-    if(NOT USE_SYSTEM_NCCL AND USE_NCCL AND NOT USE_ROCM)
+-      add_dependencies(gloo_cuda nccl_external)
+-    endif()
+-    # Pick the right dependency depending on USE_CUDA
+-    list(APPEND Caffe2_DEPENDENCY_LIBS gloo)
+-    if(USE_CUDA)
+-      list(APPEND Caffe2_CUDA_DEPENDENCY_LIBS gloo_cuda)
+-    elseif(USE_ROCM)
+-      list(APPEND Caffe2_HIP_DEPENDENCY_LIBS gloo_hip)
+-    endif()
+-    add_compile_options(-DCAFFE2_USE_GLOO)
+-  endif()
+-endif()
+-
+ if(USE_DISTRIBUTED AND USE_TENSORPIPE)
+   if(MSVC)
+     message(WARNING "Tensorpipe cannot be used on Windows.")
+diff --git a/cmake/Modules/FindDaiet.cmake b/cmake/Modules/FindDaiet.cmake
+new file mode 100644
+index 0000000000..38655a9998
+--- /dev/null
++++ b/cmake/Modules/FindDaiet.cmake
+@@ -0,0 +1,33 @@
++# Try to find Daiet library and headers.
++#  Daiet_FOUND        - system has Daiet lib
++#  Daiet_INCLUDE_DIRS - the Daiet include directory
++#  Daiet_LIBRARY Dpdk_LIBRARY
++
++find_path(Daiet_INCLUDE_DIR
++  NAMES daiet/common.hpp
++  DOC "The directory where Daiet includes reside"
++)
++
++find_library(Daiet_LIBRARY
++  NAMES libdaiet.a daiet
++  DOC "The Daiet library"
++)
++
++find_library(Dpdk_LIBRARY
++  NAMES libdpdk.a dpdk
++  DOC "The DPDK library"
++)
++
++message("DAIET INCLUDE DIR: " ${Daiet_INCLUDE_DIR})
++message("DAIET LIBRARY PATH: " ${Daiet_LIBRARY})
++message("DPDK LIBRARY PATH: " ${Dpdk_LIBRARY})
++
++set(Daiet_INCLUDE_DIRS ${Daiet_INCLUDE_DIR})
++
++include(FindPackageHandleStandardArgs)
++find_package_handle_standard_args(Daiet
++  FOUND_VAR Daiet_FOUND
++  REQUIRED_VARS Daiet_INCLUDE_DIR Daiet_LIBRARY Dpdk_LIBRARY
++)
++
++mark_as_advanced(Daiet_FOUND)
+diff --git a/cmake/Modules/FindGloo.cmake b/cmake/Modules/FindGloo.cmake
+index e965326e2e..b4e7274fab 100644
+--- a/cmake/Modules/FindGloo.cmake
++++ b/cmake/Modules/FindGloo.cmake
+@@ -9,12 +9,12 @@ find_path(Gloo_INCLUDE_DIR
+ )
+ 
+ find_library(Gloo_NATIVE_LIBRARY
+-  NAMES gloo
++  NAMES libgloo.a gloo
+   DOC "The Gloo library (without CUDA)"
+ )
+ 
+ find_library(Gloo_CUDA_LIBRARY
+-  NAMES gloo_cuda
++  NAMES libgloo_cuda.a gloo_cuda
+   DOC "The Gloo library (with CUDA)"
+ )
+ 
+diff --git a/setup.py b/setup.py
+index 2db381644c..4613cf4942 100644
+--- a/setup.py
++++ b/setup.py
+@@ -292,7 +292,7 @@ def build_deps():
+             report("Did you run 'git submodule update --init --recursive'?")
+             sys.exit(1)
+ 
+-    check_file(os.path.join(third_party_path, "gloo", "CMakeLists.txt"))
++    # check_file(os.path.join(third_party_path, "gloo", "CMakeLists.txt"))
+     check_file(os.path.join(third_party_path, 'cpuinfo', 'CMakeLists.txt'))
+     check_file(os.path.join(third_party_path, 'tbb', 'Makefile'))
+     check_file(os.path.join(third_party_path, 'onnx', 'CMakeLists.txt'))
+diff --git a/tools/setup_helpers/cmake.py b/tools/setup_helpers/cmake.py
+index 83253cc3a5..786011c7fe 100644
+--- a/tools/setup_helpers/cmake.py
++++ b/tools/setup_helpers/cmake.py
+@@ -247,6 +247,7 @@ class CMake:
+              'MSVC_Z7_OVERRIDE',
+              'Numa_INCLUDE_DIR',
+              'Numa_LIBRARIES',
++             'OFFLOAD_BITMAP',
+              'ONNX_ML',
+              'ONNX_NAMESPACE',
+              'ATEN_THREADING',
+diff --git a/torch/csrc/distributed/c10d/init.cpp b/torch/csrc/distributed/c10d/init.cpp
+index 715403ac57..a82ca11b56 100644
+--- a/torch/csrc/distributed/c10d/init.cpp
++++ b/torch/csrc/distributed/c10d/init.cpp
+@@ -913,7 +913,7 @@ Arguments:
+             }
+ 
+             options.timeout = timeout;
+-            options.threads = options.devices.size() * 2;
++            options.threads = 1;
+             return std::make_shared<::c10d::ProcessGroupGloo>(
+                 store, rank, size, options);
+           }),
+diff --git a/torch/lib/c10d/CMakeLists.txt b/torch/lib/c10d/CMakeLists.txt
+index 4b206f3801..cc1c73beaa 100644
+--- a/torch/lib/c10d/CMakeLists.txt
++++ b/torch/lib/c10d/CMakeLists.txt
+@@ -69,13 +69,20 @@ endif()
+ 
+ if(USE_C10D_GLOO)
+   list(APPEND C10D_SRCS ProcessGroupGloo.cpp GlooDeviceFactory.cpp)
+-  list(APPEND C10D_LIBS gloo)
+-  if(USE_CUDA)
+-    list(APPEND C10D_LIBS gloo_cuda)
+-  endif()
+ endif()
+ 
+ add_library(c10d STATIC ${C10D_SRCS})
++if(USE_C10D_GLOO)
++  find_package(Gloo REQUIRED)
++  find_package(Daiet REQUIRED)
++  if(OFFLOAD_BITMAP)
++    target_compile_definitions(c10d PUBLIC OFFLOAD_BITMAP)
++  endif()
++  target_link_libraries(c10d PUBLIC -Wl,--whole-archive ${Daiet_LIBRARY} ${Dpdk_LIBRARY} -Wl,--no-whole-archive dl numa boost_chrono boost_system boost_thread boost_program_options ibverbs mlx5 mnl)
++  target_include_directories(c10d PUBLIC ${Gloo_INCLUDE_DIRS})
++  target_include_directories(c10d PUBLIC ${Daiet_INCLUDE_DIRS})
++  target_link_libraries(c10d PUBLIC ${Gloo_NATIVE_LIBRARY})
++endif()
+ set_property(TARGET c10d PROPERTY POSITION_INDEPENDENT_CODE ON)
+ set_property(TARGET c10d PROPERTY CXX_STANDARD 14)
+ 
+@@ -92,13 +99,6 @@ endif()
+ 
+ add_dependencies(c10d torch)
+ 
+-if(USE_C10D_GLOO)
+-  add_dependencies(c10d gloo)
+-  if(USE_CUDA)
+-    add_dependencies(c10d gloo_cuda)
+-  endif()
+-endif()
+-
+ target_include_directories(c10d PUBLIC
+   ${CMAKE_BINARY_DIR}/aten/src # provides "ATen/TypeExtendedInterface.h" to ATen.h
+   ${CMAKE_BINARY_DIR}/caffe2/aten/src # provides <TH/THGeneral.h> to THC.h
+diff --git a/torch/lib/c10d/ProcessGroupGloo.cpp b/torch/lib/c10d/ProcessGroupGloo.cpp
+index c139ac7a34..0c23251a9d 100644
+--- a/torch/lib/c10d/ProcessGroupGloo.cpp
++++ b/torch/lib/c10d/ProcessGroupGloo.cpp
+@@ -1187,14 +1187,37 @@ class AsyncAllreduceCUDAWork : public AsyncAllreduceWork {
+       ReduceOp reduceOp,
+       uint32_t tag)
+       : AsyncAllreduceWork(context, inputs, reduceOp, tag) {
++    auto input_size = inputs.size();
++#ifdef OFFLOAD_BITMAP
++    bitmaps.reserve(input_size);
++    for (size_t i = 0; i < input_size; i++) {
++      auto bitmap = inputs[i].bitmap(/* block_size */256);
++      bitmaps.push_back(bitmap);
++    }
++
++    initializeStreamsEvents(bitmaps, streams_bitmap, events_bitmap);
++    tmp_bitmap.reserve(input_size);
++#endif
+     initializeStreamsEvents(inputs, streams, events);
+ 
+     // Kick off copy from CUDA tensors to pinned CPU tensors.
+-    tmp.reserve(inputs.size());
++    tmp.reserve(input_size);
+     at::cuda::OptionalCUDAStreamGuard guard;
+-    for (size_t i = 0; i < inputs.size(); i++) {
++    const auto& scalarType = inputs[0].scalar_type();
++    if (reduceOp == ReduceOp::SUM && (scalarType == ::at::ScalarType::Float
++                                   || scalarType == ::at::ScalarType::Half
++                                   || scalarType == ::at::ScalarType::Int)) {
++      daiet = true;
++    } else {
++      daiet = false;
++    }
++    for (size_t i = 0; i < input_size; i++) {
+       guard.reset_stream(streams[i]);
+       tmp.push_back(pinnedLike(inputs[i]).copy_(inputs[i], true));
++#ifdef OFFLOAD_BITMAP
++      guard.reset_stream(streams_bitmap[i]);
++      tmp_bitmap.push_back(pinnedLike(bitmaps[i]).copy_(bitmaps[i], true));
++#endif
+     }
+   }
+ 
+@@ -1204,10 +1227,51 @@ class AsyncAllreduceCUDAWork : public AsyncAllreduceWork {
+     for (size_t i = 0; i < inputs.size(); i++) {
+       device_guard.set_index(inputs[i].device().index());
+       AT_CUDA_CHECK(cudaStreamSynchronize(streams[i]));
++#ifdef OFFLOAD_BITMAP
++      device_guard.set_index(bitmaps[i].device().index());
++      AT_CUDA_CHECK(cudaStreamSynchronize(streams_bitmap[i]));
++#endif
+     }
+ 
+     // Run allreduce on host side tensors.
+-    allreduce(tmp);
++    if (daiet) {
++      const auto& scalarType = inputs[0].scalar_type();
++      switch (scalarType) {
++        case ::at::ScalarType::Float:
++          context->daietContext.AllReduce(getDataPointer<float>(tmp[0]),
++                                          int(tmp[0].numel())
++#ifdef OFFLOAD_BITMAP
++                                          ,
++                                          getDataPointer<uint8_t>(tmp_bitmap[0]),
++                                          int(tmp_bitmap[0].numel())
++#endif
++          );
++          break;
++        case ::at::ScalarType::Half:
++          context->daietContext.AllReduce(getDataPointer<gloo::float16>(tmp[0]),
++                                          int(tmp[0].numel())
++#ifdef OFFLOAD_BITMAP
++                                          ,
++                                          getDataPointer<uint8_t>(tmp_bitmap[0]),
++                                          int(tmp_bitmap[0].numel())
++#endif
++          );
++          break;
++        case ::at::ScalarType::Int:
++          context->daietContext.AllReduce(getDataPointer<int32_t>(tmp[0]),
++                                          int(tmp[0].numel())
++#ifdef OFFLOAD_BITMAP
++                                          ,
++                                          getDataPointer<uint8_t>(tmp_bitmap[0]),
++                                          int(tmp_bitmap[0].numel())
++#endif
++          );
++          break;
++      } // switch case block
++    } else {
++      // offload to gloo
++      allreduce(tmp);
++    }
+ 
+     at::cuda::OptionalCUDAStreamGuard stream_guard;
+     for (size_t i = 0; i < inputs.size(); i++) {
+@@ -1228,9 +1292,16 @@ class AsyncAllreduceCUDAWork : public AsyncAllreduceWork {
+     }
+   }
+ 
++  bool daiet;
+   std::vector<at::Tensor> tmp;
+   std::vector<at::cuda::CUDAStream> streams;
+   std::vector<at::cuda::CUDAEvent> events;
++#ifdef OFFLOAD_BITMAP
++  std::vector<at::cuda::CUDAEvent> events_bitmap;
++  std::vector<at::Tensor> bitmaps;
++  std::vector<at::Tensor> tmp_bitmap;
++  std::vector<at::cuda::CUDAStream> streams_bitmap;
++#endif
+ };
+ 
+ class AsyncSparseAllreduceCUDAWork : public AsyncSparseAllreduceWork {

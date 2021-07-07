@@ -1,0 +1,12 @@
+[submodule "omnireduce-DPDK/gloo"]
+	path = omnireduce-DPDK/gloo
+	url = https://github.com/facebookincubator/gloo.git
+[submodule "omnireduce-DPDK/pytorch"]
+	path = omnireduce-DPDK/pytorch
+	url = https://github.com/pytorch/pytorch.git
+[submodule "omnireduce-DPDK/daiet/lib/dpdk"]
+	path = omnireduce-DPDK/daiet/lib/dpdk
+	url = https://github.com/sands-lab/dpdk.git
+[submodule "omnireduce-DPDK/daiet/lib/vcl"]
+	path = omnireduce-DPDK/daiet/lib/vcl
+	url = https://github.com/vcoda/vectorclass.git
