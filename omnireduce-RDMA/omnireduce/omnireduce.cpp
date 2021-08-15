@@ -115,7 +115,7 @@ namespace omnireduce {
         int ret = 0;
 
         //step 1 - establish TCP connection for info exchange
-        uint32_t tcp_port = TCP_PORT;
+        uint32_t tcp_port = omnireduce_par.getTcpPort();;
         dctx_ptr->socks = (int *)malloc(num_aggregators*sizeof(int));
         struct addrinfo *resolved_addr = NULL;
         struct addrinfo *iterator;
@@ -358,7 +358,7 @@ namespace omnireduce {
         int sl = omnireduce_par.getServiceLevel();
         int ret = 0;
         //step 1 - establish TCP connection for info exchange
-        uint32_t tcp_port = TCP_PORT;
+        uint32_t tcp_port = omnireduce_par.getTcpPort();
         dctx_ptr->socks = (int *)malloc(num_workers*sizeof(int));
         struct addrinfo *resolved_addr = NULL;
         struct addrinfo *iterator;

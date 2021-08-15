@@ -18,7 +18,6 @@
 #define MAX_NUM_AGGS 8
 #define MAX_CONCURRENT_WRITES 4096
 #define QUEUE_DEPTH_DEFAULT 4096
-#define TCP_PORT 19875
 #define QPNUM_FACTOR 8
 
 namespace omnireduce {
@@ -45,6 +44,7 @@ namespace omnireduce {
             uint32_t direct_memory;
             uint32_t adaptive_blocksize;
             uint32_t gpu_devId;
+            uint32_t tcp_port;
             float threshold;
             char *ib_hca;
             int ib_port;
@@ -175,6 +175,9 @@ namespace omnireduce {
             void setThreshold(float th) {
                 threshold = th;
             }
+            void setTcpPort(uint32_t p) {
+                tcp_port = p;
+            }
             uint32_t getBuffUnitSize() {
                 return buff_unit_size;
             }
@@ -252,6 +255,9 @@ namespace omnireduce {
             }
             float getThreshold() {
                 return threshold;
+            }
+            uint32_t getTcpPort() {
+                return tcp_port;
             }
     };
 
