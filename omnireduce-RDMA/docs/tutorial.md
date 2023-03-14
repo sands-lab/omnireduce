@@ -24,7 +24,7 @@ Firstly, you need to create the `omnireduce.cfg` according to [this](https://git
 | `worker_ips` | 10.0.0.10,10.0.0.11 |
 | `worker_ips` | 10.0.0.20,10.0.0.21 |
 
-If your worker supports GPUDirect, set `direct_memory` to be 1. With regard to RDMA configuration, you need to update related parameters according to you system information. You can use the MLNX OFED's [show_gids](https://community.mellanox.com/s/article/understanding-show-gids-script) script to get the device (`ib_hca`), port(`ib_port`) and index GID(`gid_idx`).
+If your worker supports GPUDirect, set `direct_memory` to be 1. With regard to RDMA configuration, you need to update related parameters according to you system information. You can use the MLNX OFED's [show_gids](https://enterprise-support.nvidia.com/s/article/understanding-show-gids-script) script to get the device (`ib_hca`), port(`ib_port`) and index GID(`gid_idx`).
 
 ### Run benchmark
 
